@@ -14,7 +14,24 @@ from llama import Llama, load_pretrained
 from optimizer import AdamW
 from tokenizer import Tokenizer
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, List, Tuple, Any
+
+from collections import defaultdict
+
+def reorder_by_labels(data: List[Tuple[Any, Any, Any]], label_order: List[Any]) -> List[Tuple[Any, Any, Any]]:
+    if not data or not label_order:
+        raise ValueError("data 和 label_order 都不能是空的")
+
+    label_groups = defaultdict(list)
+    for item in data:
+        label_groups[item[1]].append(item)
+
+    result = []
+    while any(label_groups.values()):
+        for label in label_order:
+            if label_groups[label]:
+                result.append(label_groups[label].pop(0))
+    return result
 
 
 TQDM_DISABLE=False
@@ -86,6 +103,7 @@ def create_data(filename, tokenizer: Tokenizer, flag: str ='train', lower: bool 
 				num_labels[label] = len(num_labels)
 			data.append((sent, label, tokens))
 	print(f"load {len(data)} data from {filename}")
+	data = reorder_by_labels(data, range(len(num_labels)))
 	if flag == 'train':
 		return data, len(num_labels)
 	else:
@@ -196,6 +214,84 @@ def train(args):
 
 		print(f"epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
 
+def train_with_fewshot(args, prompt_suffix: Optional[str]=None):
+	device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+	#### Load data
+	# create the data and its corresponding datasets and dataloader
+	tokenizer = Tokenizer(args.max_sentence_len)
+	label_names = json.load(open(args.label_names, 'r'))
+	train_data, num_labels = create_data(args.train, tokenizer, 'train', eos=False, prompt_suffix=prompt_suffix)
+	dev_data = create_data(args.dev, tokenizer, 'valid', eos=False, prompt_suffix=prompt_suffix)
+
+	# few-shot
+	if args.num_shots < 1:
+		raise ValueError("Number of shots overflow.")	
+	elif args.num_shots > len(train_data):
+		args.num_shots = len(train_data)
+	max_index = len(train_data) - args.num_shots
+	start_index = random.randint(0, max_index)
+	train_data = train_data[start_index:start_index + args.num_shots]
+
+	train_dataset = LlamaDataset(train_data, args)
+	dev_dataset = LlamaDataset(dev_data, args)
+
+	train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size,
+								  collate_fn=train_dataset.collate_fn)
+	dev_dataloader = DataLoader(dev_dataset, shuffle=False, batch_size=args.batch_size,
+								collate_fn=dev_dataset.collate_fn)
+
+	#### Init model
+	config = {'hidden_dropout_prob': args.hidden_dropout_prob,
+			  'pretrained_model_path': args.pretrained_model_path,
+			  'num_labels': num_labels,
+			  'data_dir': '.',
+			  'option': args.option}
+
+	config = SimpleNamespace(**config)
+
+	# initialize the Senetence Classification Model
+	# model = LlamaZeroShotClassifier(config, tokenizer, label_names)
+	model = LlamaEmbeddingClassifier(config)
+	model = model.to(device)
+
+	lr = args.lr
+	## specify the optimizer
+	optimizer = AdamW(model.parameters(), lr=lr)
+	best_dev_acc = 0
+
+	## run for the specified number of epochs
+	for epoch in tqdm(range(args.epochs)):
+		model.train()
+		train_loss = 0
+		num_batches = 0
+		for step, batch in enumerate(tqdm(train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)):
+			b_ids, b_labels, b_sents = batch['token_ids'], batch['labels'], batch['sents']
+
+			b_ids = b_ids.to(device)
+			b_labels = b_labels.to(device)
+
+			optimizer.zero_grad()
+			logits = model(b_ids)
+			loss = F.nll_loss(logits, b_labels.view(-1), reduction='sum') / args.batch_size
+
+			loss.backward()
+			optimizer.step()
+
+			train_loss += loss.item()
+			num_batches += 1
+
+		train_loss = train_loss / (num_batches)
+
+		train_acc, train_f1, *_ = model_eval(train_dataloader, model, device)
+		dev_acc, dev_f1, *_ = model_eval(dev_dataloader, model, device)
+
+		if dev_acc > best_dev_acc:
+			best_dev_acc = dev_acc
+			save_model(model, optimizer, args, config, args.filepath)
+
+		print(f"epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
+
+
 def generate_sentence(args, prefix, outfile, max_new_tokens = 75, temperature = 0.0):
 	with torch.no_grad():
 		device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
@@ -227,7 +323,7 @@ def write_predictions_to_file(split: str, outfile: str, acc: float, pred: list[s
 		for s, p in zip(sents, pred):
 			f.write(f"{p} ||| {s}\n")
 
-def test_with_prompting(args):
+def test_with_prompting(args, prompt_suffix: Optional[str]=None):
 	assert args.dev_out.endswith("dev-prompting-output.txt"), 'For saving prompting results, please set the dev_out argument as "<dataset>-dev-prompting-output.txt"'
 	assert args.test_out.endswith("test-prompting-output.txt"), 'For saving prompting results, please set the test_out argument as "<dataset>-test-prompting-output.txt"'
 
@@ -249,11 +345,11 @@ def test_with_prompting(args):
 
 		config = SimpleNamespace(**config)
 
-		if len(label_names) == 2:
-			label_name_str = " or ".join(label_names)
-		else:
-			label_name_str = ", ".join(label_names[:-1]) + ", or " + label_names[-1]
-		prompt_suffix=f"Is this movie {label_name_str}? This movie is "
+		# if len(label_names) == 2:
+		# 	label_name_str = " or ".join(label_names)
+		# else:
+		# 	label_name_str = ", ".join(label_names[:-1]) + ", or " + label_names[-1]
+		# prompt_suffix=f"Is this movie {label_name_str}? This movie is "
 		model = LlamaZeroShotClassifier(config, tokenizer, label_names)
 		model = model.to(device)
 
@@ -271,7 +367,7 @@ def test_with_prompting(args):
 		write_predictions_to_file("dev", args.dev_out, dev_acc, dev_pred, dev_sents)
 		write_predictions_to_file("test", args.test_out, test_acc, test_pred, test_sents)
 
-def test(args):
+def test(args, prompt_suffix: Optional[str]=None):
 	assert args.dev_out.endswith("dev-finetuning-output.txt"), 'For saving finetuning results, please set the dev_out argument as "<dataset>-dev-finetuning-output.txt"'
 	assert args.test_out.endswith("test-finetuning-output.txt"), 'For saving finetuning results, please set the test_out argument as "<dataset>-test-finetuning-output.txt"'
 	with torch.no_grad():
@@ -283,11 +379,11 @@ def test(args):
 		model = model.to(device)
 		print(f"load model from {args.filepath}")
 		tokenizer = Tokenizer(args.max_sentence_len)
-		dev_data = create_data(args.dev, tokenizer, 'valid')
+		dev_data = create_data(args.dev, tokenizer, 'valid', eos=False, prompt_suffix=prompt_suffix)
 		dev_dataset = LlamaDataset(dev_data, args)
 		dev_dataloader = DataLoader(dev_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=dev_dataset.collate_fn)
 
-		test_data = create_data(args.test, tokenizer, 'test')
+		test_data = create_data(args.test, tokenizer, 'test', eos=False, prompt_suffix=prompt_suffix)
 		test_dataset = LlamaDataset(test_data, args)
 		test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=test_dataset.collate_fn)
 
@@ -309,7 +405,7 @@ def get_args():
 	parser.add_argument("--epochs", type=int, default=5)
 	parser.add_argument("--option", type=str,
 						help='prompt: the Llama parameters are frozen; finetune: Llama parameters are updated',
-						choices=('generate', 'prompt', 'finetune'), default="generate")
+						choices=('generate', 'prompt', 'finetune', 'fewshot', 'prompt_tune'), default="generate")
 	parser.add_argument("--use_gpu", action='store_true')
 	parser.add_argument("--generated_sentence_low_temp_out", type=str, default="generated-sentence-temp-0.txt")
 	parser.add_argument("--generated_sentence_high_temp_out", type=str, default="generated-sentence-temp-1.txt")
@@ -321,6 +417,7 @@ def get_args():
 	parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
 	parser.add_argument("--lr", type=float, help="learning rate, default lr for 'pretrain': 1e-3, 'finetune': 1e-5",
 						default=2e-5)
+	parser.add_argument("--num_shots", type=int, default=4)
 
 	args = parser.parse_args()
 	print(f"args: {vars(args)}")
@@ -330,6 +427,13 @@ if __name__ == "__main__":
 	args = get_args()
 	args.filepath = f'{args.option}-{args.epochs}-{args.lr}.pt' # save path
 	seed_everything(args.seed)  # fix the seed for reproducibility
+	args.filepath = f'{args.num_shots}shot-{args.option}-{args.epochs}-{args.lr}.pt' # save path
+	label_names = json.load(open(args.label_names, 'r'))
+	if len(label_names) == 2:
+		label_name_str = " or ".join(label_names)
+	else:
+		label_name_str = ", ".join(label_names[:-1]) + ", or " + label_names[-1]
+	prompt_suffix=f"Is this movie {label_name_str}? This movie is "
 
 	if args.option == "generate":
 		# Step 1
@@ -340,7 +444,7 @@ if __name__ == "__main__":
 	elif args.option == "prompt":
 		# Step 2
 		# Solve this task with prompted language modeling
-		test_with_prompting(args)
+		test_with_prompting(args, prompt_suffix=prompt_suffix)
 	elif args.option == "finetune":
 		# Step 3
 		# Finetune a classification model
@@ -349,5 +453,12 @@ if __name__ == "__main__":
 		# Step 4
 		# Evaluate your model on the dev and test sets
 		test(args)
+	elif args.option == "fewshot":
+		args.filepath = f'{args.num_shots}shot-{args.epochs}-{args.lr}.pt' # save path
+		train_with_fewshot(args)
+		test(args)
+	elif args.option == "prompt_tune":
+		train_with_fewshot(args, prompt_suffix=prompt_suffix)
+		test(args, prompt_suffix=prompt_suffix)
 	else:
 		raise ValueError(f"Invalid option: {args.option}")

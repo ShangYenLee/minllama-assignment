@@ -14,7 +14,10 @@ class LlamaZeroShotClassifier(torch.nn.Module):
 		self.llama = load_pretrained(config.pretrained_model_path)
 		# Zero-shot classification does not require updating llama paramters.
 		for param in self.llama.parameters():
-			param.requires_grad = False
+			if config.option == 'fewshot' or config.option == 'prompt_tune':
+				param.requires_grad = True
+			else:
+				param.requires_grad = False
 		assert len(label_names) == self.num_labels
 		self.tokenizer = tokenizer
 		self.label_name_ids = [tokenizer.encode(label, bos=False, eos=False) for label in label_names]
@@ -39,7 +42,7 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		for param in self.llama.parameters():
 			if config.option == 'pretrain':
 				param.requires_grad = False
-			elif config.option == 'finetune':
+			elif config.option == 'finetune' or config.option == 'fewshot' or config.option == 'prompt_tune':
 				param.requires_grad = True
 
 		self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
